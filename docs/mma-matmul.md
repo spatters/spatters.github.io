@@ -6,60 +6,64 @@ permalink: /mma-matmul
 ---
 Using tensor cores is a prerequisite to get anywhere near peak performance matrix multiplication on NVIDIA GPUs. Compared to traditional CUDA programming, there are not many resources demonstrating how to write efficient Tensor Core kernels. There is a canonical open source library (CUTLASS) to learn from but its heavy use of C++ templates means the code can be difficult to parse.
 
-In this post we work through the process of developing an efficient Tensor Core matrix multiplication kernel targeting the Ada architecture. We start with a naive implementation and by incorporating several techniques used in CUTLASS and discussed in a GTC presentaion[^3], finish with a kernel that achieves slightly higher than cuBLAS performance (on one particular problem specification):
+In this post we work through the process of developing an efficient Tensor Core matrix multiplication kernel targeting the Ada architecture. We start with a naive implementation and by incorporating several techniques used in CUTLASS[^3], finish with a kernel that matches cuBLAS performance on one particular problem specification:
 
-| Kernel | Execution Time | TFLOP/s | % cuBLAS | % RTX 4090 peak |
+| Kernel | Execution Time | TFLOP/s &nbsp; &nbsp; | cuBLAS % &nbsp; &nbsp;  | 4090 peak % &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; |
 | ---    | ---     | ---                 | ---                  | --- |
-| cublasGemmEx | 860 us | 159.8 | 100% |  96.7%  |
+| cublasGemmEx | 890 us | 154.4 | 100% |  93.5%  |
 | Kernel 1: Naive MMA | 4.41 ms | 31.2 | 19.5% | 18.9%   |
 | Kernel 1b: Naive + 2x tiling| 2.26 ms | 60.8 | 38.1% | 36.8%   |
 | Kernel 2: Permuted shared memory layout | 4.3ms | 20 | 19.3% |    |
 | Kernel 3: N stage async pipeline | 4.3ms | 20 | 19.3% |    |
 | Kernel 4: N stage + 4x tiling | 840 us | 163.6 | 102.3% | 99.0%   |
 
-The code is written as simply as possible: the aim is ease of understanding rather than generality. As may be clear already, this post was heavily inspired by Simon Boehm's great post on optimizing a CUDA matmul kernel[^8]. 
+In the process of doing this we'll learn about the `mma`, `ldmatrix` and `cp.async` PTX instructions, and how to call inline PTX from CUDA code. The code is written as simply as possible: the aim is ease of understanding rather than generality. 
 
-### Problem Definition and Benchmarking Setup
+As may be clear already, this post was heavily inspired by Simon Boehm's great post on optimizing a CUDA matmul kernel[^8]. 
+
+### Problem Definition 
 We'll focus on one particular set of shapes: M=N=K=4096, and data types: fp16 A/B, fp32 C/D.  The FLOP count of this operation is `2*4096^3 = 137.4 GFLOP`[^2] (convential to count one FMA as 2 FLOP) and the peak fp16/32 throughput of the RTX 4090 is 165.2 TFLOP/s[^6], so the lower bound on kernel execution time is ~830 us.
 
-As a baseline for peformance we use the cuBLAS `cublasGemmEx` API with `fp16` inputs and`fp32` accumulation. This performs a `M=N=K=4096` matrix multiply in 860 us, that is a performance of 159.8 TFLOPS, close to the RTX 4090's peak `fp16/32` performance of 165.2 TFLOPS.
+We can use the RTX 4090s peak throughput to deduce how many cycles one Tensor Core instruction takes to complete (latency). All our kernels will use the PTX `m16n8k16` `mma` instruction, this is the largest Tensor Core matmul supported on Ada so it's reasonable to assume the peak throughput is obtained using this instruction. The m16n8k16 operation is `2*16*8*16=4096` FLOPS, and there are 512 Tensor Cores on the RTX 4090, hence computing one mma on all Tensor Cores gives 2,097,152 FLOPS. Given the peak throughput of 165.2 TFLOPS/S at the boost clock of 2520 MHz, it must take 12.7 ns = 32 cycles for the m16n8k16 `mma` operation to complete. This is roughly consistent with empirical benchmarks[^7].
 
-How to accurately time CUDA kernel execution could fill an entire post but in summary either using events in a loop and discarding the first 5-10 times or using nsight-compute give broadly consistent results if you first lock the gpu and memory clocks. Results in this post were obtained using nsight-compute as it meatures kernel execution more precisely than possible with events [^5]. The commmands used are as follows:
+Our problem shape of M=N=K=4096 requires 256x512x256 = 33,554,432 individual m16n8k16 `mma` instructions, which is 65,536 card-wide waves of `mma`s. Hence in the best case, with no cycles stalled waiting for input, the minimum number of cycles this will take is 65,636 * 32 = 2,097,152, which is 832 us at the boost clock of 2520 MHz. Note this agrees with the number computed using peak throughput by definition as we computed the 32 cycle latency from the throughput. So there's no new information here but thinking about the time in terms of number of instructions and cycles is helpful to understand nsight-compute metrics.
+
+#### Benchmarking Setup
+As a baseline for peformance we use the cuBLAS `cublasGemmEx` API with `fp16` inputs and`fp32` accumulation. This performs a `M=N=K=4096` matrix multiply in 890 us which is a throughput of 154.4 TFLOPS/s, 93.5% of the RTX 4090's peak.
+
+How to accurately time CUDA kernel execution could fill an entire post but in summary either cuda events or nsight-compute give broadly consistent results if you first lock the gpu and memory clocks. I used nsight-compute as it measures kernel execution more precisely than possible using events [^5]. 
+
+By default nsight-compute will lock to the GPUs base clock, but as I wanted to compare to the RTX 4090s stated peak throughput I aimed to lock at the boost clock of 2520 MHz. This issomewhat difficult in practice as locking at 2520 results in nsight-compute reporting slightly lower clock frequencies. As a result I locked at 2550 and report results based on runs where nsight-compute reports the clock as 2520. The commands to lock clocks and run the profiler are:
+
 ```bash
 sudo nvidia-smi -pm ENABLED
-sudo nvidia-smi --lock-gpu-clocks=3105     // max for RTX 4090
-sudo nvidia-smi --lock-memory-clocks=10501 // max for RTX 4090
-ncu -k kernel_name --clock-control none --print-summary per-gpu ./my-prog
-sudo nvidia-smi --reset-gpu-clocks
-sudo nvidia-smi --reset-memory-clocks
-sudo nvidia-smi -pm DISABLED
+sudo nvidia-smi --lock-gpu-clocks=2550     # lock slightly higher than boost clock
+sudo nvidia-smi --lock-memory-clocks=10501 # max for RTX 4090
+ncu -k $my_kernel_name --clock-control none --print-summary per-gpu $my_executable
 ```
 
 #### Aside: Tensor Core Matrix Multiply APIs
-There are three Tensor Core matmul APIs in CUDA/PTX:
+There are three separate Tensor Core matmul APIs in CUDA/PTX:
 * WMMA: High level API available in both [CUDA](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-matrix-functions) and [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-wmma-instructions)
 * MMA: Lower level API just available in [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-mma-instruction)
 * WGMMA: New sm_90 API that operates on warp-groups (consecutive groups of 4 warps). Just available in [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-multiply-accumulate-instructions)
 
-This post uses the mma PTX API. wgmma is not an option as I am using an Ada architecture GPU. I chose mma over wmma as mma is a lower level API and my aim is to build as deep an understanding of Tensor Core operations as possible. Using mma also reportedly delivers higher performance than wmma though that comparison is old[^1].
+All kernels in this post use the PTX mma API. wgmma is not an option as I am using an Ada architecture GPU. I chose mma over wmma as mma is a lower level API and my aim is to build as deep an understanding of Tensor Core operations as possible. Using mma also reportedly delivers higher performance than wmma though that comparison is old[^1].
 
 ### Kernel 1: Naive mma.sync kernel
 The first kernel is a naive implementation resulting from reading the `mma.sync` instruction documentation and handling data movement from global memory to registers in the simplest way possible. 
 
-In the Ada architecture there are 4 warp schedulers per SM, each with their own Tensor Core. Hence we want to have at least 4 warps per thread block(not strictly required as multiple thread blocks can run concurrently on one SM). In this kernel we use a 16x16 thread block, containing 8 warps. Each warp computes one 16x8 output tile and we arrange the warps in a 2 row x 4 column grid, so that each thread block computes a 32x32 output tile.
+In the Ada architecture there are 4 warp schedulers per SM, each with their own Tensor Core. Hence we want at least 4 warps per thread block (not strictly required as multiple thread blocks can run concurrently on one SM). In this kernel we use a 16x16 thread block, containing 8 warps. Each warp computes one 16x8 output tile and we arrange the warps in a 2 row x 4 column grid, so that each thread block computes a 32x32 output tile.
 
 ```c
 // arrangement of warps in output tile
 // (warp_0 | warp_1 | warp_2 | warp_3)
 // (warp_4 | warp_5 | warp_6 | warp_7)
 ```
-
-There are multiple `mma.sync` instructions for different data types and matrix shapes. In this and all subsequent kernels, we'll use
+There are multiple `mma.sync` instructions for different data types and matrix shapes. As mentioned previously, in this and all subsequent kernels we'll use
 - `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` 
 
-which performs (per warp) the matrix multiplication `D = A*B + C` where A is a `16x16` `fp16` matrix, `B` is `16x8` `fp16` matrix and C/D are 16x8 `fp32` matrices. The number of cycles (latency) this instruction takes to complete is not documented but we can calculate it as follows.
-
-The m16n8k16 operation contains 4224 FLOPS, and there are 512 Tensor Cores on the RTX 4090, hence using all Tensor Cores gives 2,162,688 FLOPS. As the RTX 4090's peak throughput is 165.2 TFLOP/S, this implies the m16n8k16 mma must have a latency of ~13 ns, or roughy 33 cycles at the RTX 4090's boost clock of 2550 MHz. This is consistent with empirical benchmarks[^7]. This latency figure will be useful later when reasoning about kernel performance.
+which performs (per warp) the matrix multiplication `D = A * B + C` where A is a `16x16` `fp16` matrix, `B` is `16x8` `fp16` matrix and C/D are 16x8 `fp32` matrices. 
 
 As `mma` is a PTX instruction, calling it from CUDA code requires using [inline PTX](https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html) which we wrap in a helper function:
 {% raw %}
@@ -77,13 +81,13 @@ __device__ void mma_m16n8k16(const unsigned *A, const unsigned *B, float *C, flo
 }
 ```
 {% endraw %}
-The `mma` instruction is warp-wide, with each of the 32 threads provides 8 `fp16` elements from A, 4 `fp16` elements from B and 4 `fp32` elements from C, and recieves 4 output `fp32` elements from D. The 8 `fp16` elements of A are packed into 4 32 bit registers, and similarly the 4 elements of B into 2 32 bit registers.
+The `mma` instruction is warp-wide, each of the 32 threads provides 8 `fp16` elements from A, 4 `fp16` elements from B and 4 `fp32` elements from C, and recieves 4 output `fp32` elements from D. The 8 `fp16` elements of A are packed into 4 32 bit registers, and similarly the 4 elements of B into 2 32 bit registers.
 
-The matrix elements held by each thread in its registers are called a matrix fragment, and the required mapping from thread ID to fragments for A is shown below
+The matrix elements held by each thread in its registers are called a matrix fragment, and the required mapping from thread ID to fragments for A is shown below:
 ![a-fragment](/assets/images/a-fragment.png)
 A is split into 4 8x8 submatrices, and each submatrix is split across the warp in a row major fashion which each thread holding two `fp16` values in one of its 32 bit registers. Mappings for `B, C & D` are defined similarly and can be found in the [PTX docs](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float).
 
-The main loop of Kernel 1 contains the code to load matrix fragments to registers and call the `mma` instruction.
+We will later use the `ldmatrix` instruction to load fragements to registers, but for now we'll do this per thread to demostrate the mapping. The main loop of Kernel 1 contains the code to load matrix fragments to registers and call the `mma` instruction.
 
 ```c++
 for (int kStart=0; kStart < K; kStart += K_BLOCK) {
@@ -118,14 +122,39 @@ for (int kStart=0; kStart < K; kStart += K_BLOCK) {
 }
 ```
 #### Performance
-Kernel 1 has an execution time of 4.41 ms, giving a throughput of 31.2 TFLOP/S, 19.3% of cuBLAS and 18.7% of peak RTX 4090 performance. In fact Kernel 1 only achieves 37.4% of the RTX 4090s peak FP32 performance, so a reasonably optimized non Tensor Core kernel would be faster. This is obviously not great, so what are the reasons for this poor performance? 
+Kernel 1 has an execution time of 4.67 ms, giving a throughput of 29.4 TFLOP/S, 19.1% of cuBLAS and 17.8% of peak RTX 4090 performance. In fact Kernel 1 only achieves 35.6% of the RTX 4090's peak FP32 performance, so a reasonably optimized non Tensor Core kernel would be faster. The reasons for the poor performance are:
 1. Each thread loads individual 16b values which is very inefficient. Also the global load pattern is not coalesced. 
 2. The loads from shared memory to registers have multiple bank conflicts. 
 3. Each element loaded is only used in the input to one `mma` instruction, so the ratio of memory access to computation is low. 
 
-These points will be addressed in Kernel 2: point 1 by using vectorized and coalesced loads, point 2 by using a permuted shared memory layout and point 3 as each warp will compute multiple output tiles. 
+The Warp State Statistics chart in nsight-compute shows the impact of these problems: on average per instruction executed a warp spends 31 cycles stalled on shared memory throttles (MIO), 15 cycles stalled on barrier waits and 11 stalled on long scoreboard (global load) dependencies.
 
-To isolate the impact made just by tiling vs the other changes, we add 2x tiling in the M and N dimensions in Kernel 1b. In this kernel each warp executes 4 `mma` instructions meaning each thread block computes a 64x64 output tile. This reduces execution time to 2.26 ms, increasing throuput to 60.8 TFLOP/S, 38% of cuBLAS performance.
+![kernel-1-warp-stats](/assets/images/kernel-1-warp-stats-1.png)
+
+ We can also use the profiler to  query the count of `mma` instructions executed, all instructions executed and elapsed cycles for each SM sub-partition:
+```bash
+------------------------------------------- ----------- -------------
+Metric Name                                 Metric Unit  Metric Value
+------------------------------------------- ----------- -------------
+sm__cycles_elapsed.avg                            cycle 11,787,459.33
+sm__cycles_elapsed.max                            cycle    11,822,127
+sm__cycles_elapsed.min                            cycle    11,739,016
+sm__cycles_elapsed.sum                            cycle 1,508,794,794
+smsp__inst_executed.avg                            inst     2,051,328
+smsp__inst_executed.max                            inst     2,067,354
+smsp__inst_executed.min                            inst     2,035,302
+smsp__inst_executed.sum                            inst 1,050,279,936
+smsp__inst_executed_pipe_tensor_op_hmma.avg        inst        65,536
+smsp__inst_executed_pipe_tensor_op_hmma.max        inst        66,048
+smsp__inst_executed_pipe_tensor_op_hmma.min        inst        65,024
+smsp__inst_executed_pipe_tensor_op_hmma.sum        inst    33,554,432
+------------------------------------------- ----------- -------------
+```
+The total number of `mma` instructions is 33,554,432 as calculated earlier, with 65,536 being computed on each Tensor Core. The number of cycles elapsed per `mma` was 11,787,459 / 65,536 = 179.9, we are far from the 32 cycles best case. Another useful statistic is the ratio of `mma` instructions to total instructions which is `65,536 / 2,051,328 = 0.03`, so in Kernel 1 for each `mma` instruction we perform around 30 other instructions to load data, compute addresses etc. 
+
+These three problems with Kernel 1 will be addressed in Kernel 2: Point 1 by using vectorized and coalesced loads, Point 2 by using a permuted shared memory layout and Point 3 as each warp will compute multiple output tiles. 
+
+To isolate the impact made just by tiling vs the other changes, we add 2x tiling in the M and N dimensions in Kernel 1b. In this kernel each warp executes 4 `mma` instructions meaning each thread block computes a 64x64 output tile. This reduces execution time to 2.47 ms, increasing throuput to 55.6 TFLOP/S, 36% of cuBLAS performance.
 
 #### Aside: Floating Point Accuracy
 NVIDIA does not fully document the exact numerical behavior of the Tensor Core `mma` instruction. The PTX ISA states: 
@@ -201,7 +230,7 @@ This diagram from [^3] illustrates how one warp loads from global to shared usin
 
 ![load-global-store-shared](/assets/images/load-global-store-shared.png)
 
-Once data is loaded to shared memory, each warp computes a matrix multiply on a (M=32, K=4) tile of A and a (N=16, K=4) tile of B. As the `mma` instruction computes a M=16, N=8, K=16 matrix multiply we split these tiles into two (M=16, K=4) tiles of A / (N=8, K=4) tiles of B and compute their products in a nested loop.  At the innermost level of this loop, we first load the k=0..1 subtiles of the current A and B tiles into registers and compute their product using the `mma` instruction. We then load the k=2..3 subtiles and perform a second `mma`. 
+Once data is loaded to shared memory, each warp computes a matmul on a (M=32, K=4) tile of A and a (N=16, K=4) tile of B. As the `mma` instruction computes a M=16, N=8, K=16 matmul we split these tiles into two (M=16, K=4) tiles of A / (N=8, K=4) tiles of B and compute their products in a nested loop. At the innermost level of this loop, we first load the k=0..1 subtiles of the current A and B tiles into registers and compute their product using the `mma` instruction. We then load the k=2..3 subtiles and perform a second `mma`. 
 
 We use the `ldmatrix` PTX instruction to load these tiles from shared memory to registers. This warp-wide instruction loads 1, 2 or 4 8x128b matrices, each 8x128b matrix being distributed into one 32b register per thread in the fragment layout previously discussed. Each 128b row of these matrices is stored in one `uint4` vector in shared memory and each thread in the warp provides the address of one of these rows as described in the docs:
 
@@ -239,13 +268,17 @@ Two things to note
 One the main loop has finished, the output tile for each warp is accumulated in the output registers used for the `mma` instructions. There is a `stmatrix` instruction but this requires `sm_90` so is not available on Ada. We write directly from registers to global memory, it may be possible to optimize this by writing first to shared and then writing to global in a coalesced pattern but that requires more shared memory per threadblock which could reduce occupancy. I experimented with this but did not see a performance improvement.
 
 #### Performance
-Kernel 2 has greatly increased performance. Execution time is 1.06 ms, a throughput of 129.7 TFLOP/S which is 81.1% cuBLASS and 78.5% of RTX 4090 peak performance. We can make one minor tweak to the kernel to improve performance further.
+Kernel 2 has greatly increased performance. Execution time is 1.06 ms, a throughput of 129.7 TFLOP/S which is 81.1% cuBLAS and 78.5% of RTX 4090 peak performance. We can make one minor tweak to the kernel to improve performance further, currently we reload each tile of A for each tile of B, this reduces register usage but introduces redundant loads from shared memory to registers. 
 
-To reduce the number of long scoreboard stalls, in the next kernel we will add an n-stage pipeline from global to shared memory using the `cp.async` instruction.
+In Kernel 2b we only load each tile of A once. This improves performance to 1.03 ms, 133.4 TFLOP/s, 86.4% of cuBLAS. The elapsed cycles per mma for Kernel 2b is 38, much closer to the minimum of 32. The ratio of total instrucitons to `mma` instructions is reduced from 31 for Kernel 1 to 3.9 for Kernel 2b.
+
+Looking at the warp stats shows that the most frequent cause of stalls is now waiting for the Tensor Cores to be free - this is good!
+
+![2b-warp-stats](/assets/images/kernel-2b-warp-stats-1.png)
+
+There are still considerable numbe of barrier and long scoreboard stalls, which we'll address in Kernel 3 by introducing an n-stage pipeline from global to shared memory using the `cp.async` instruction.
 
 ### Kernel 3: N-stage global to shared pipeline
-We can reduce the stalls on global memory loads and barrier waits by introducing an N stage pipeline loading from global -> shared, decoupling data loading from computation and allowing loads to overlap with execution of the `mma` instuctions. We do this using the `cp.async` PTX instruction introduced in `sm_80`. 
-
 Before moving to the full N stage pipeline we make a smaller change to Kernel 2, adding double buffering, which does not require `cp.async`. Double buffering introduces a second shared memory array for the tiles of `A` and `B`. When loading data from global to shared on each main loop iteration, we alternate between which of the two shared memory arrays we use for storage. This allows us to remove the `__syncthreads` call at the end of the main loop: as we are writing to a different shared memory array than the one we are currently reading from, we no longer need to wait for all threads in the block to be finished reading before starting to write.
 
 This requires minor changes to the main loop of the kernel as shown below:
