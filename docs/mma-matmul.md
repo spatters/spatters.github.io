@@ -21,14 +21,14 @@ In the process of doing this we'll learn about the `mma`, `ldmatrix` and `cp.asy
 
 As may be clear already, this post was heavily inspired by Simon Boehm's great post on optimizing a CUDA matmul kernel[^8]. 
 
-### Problem Definition 
+## Problem Definition 
 We'll focus on one particular set of shapes: M=N=K=4096, and data types: fp16 A/B, fp32 C/D.  The FLOP count of this operation is `2*4096^3 = 137.4 GFLOP`[^2] (convential to count one FMA as 2 FLOP) and the peak fp16/32 throughput of the RTX 4090 is 165.2 TFLOP/s[^6], so the lower bound on kernel execution time is ~830 us.
 
 We can use the RTX 4090s peak throughput to deduce how many cycles one Tensor Core instruction takes to complete (latency). All our kernels will use the PTX `m16n8k16` `mma` instruction, this is the largest Tensor Core matmul supported on Ada so it's reasonable to assume the peak throughput is obtained using this instruction. The m16n8k16 operation is `2*16*8*16=4096` FLOPS, and there are 512 Tensor Cores on the RTX 4090, hence computing one mma on all Tensor Cores gives 2,097,152 FLOPS. Given the peak throughput of 165.2 TFLOPS/S at the boost clock of 2520 MHz, it must take 12.7 ns = 32 cycles for the m16n8k16 `mma` operation to complete. This is roughly consistent with empirical benchmarks[^7].
 
 Our problem shape of M=N=K=4096 requires 256x512x256 = 33,554,432 individual m16n8k16 `mma` instructions, which is 65,536 card-wide waves of `mma`s. Hence in the best case, with no cycles stalled waiting for input, the minimum number of cycles this will take is 65,636 * 32 = 2,097,152, which is 832 us at the boost clock of 2520 MHz. Note this agrees with the number computed using peak throughput by definition as we computed the 32 cycle latency from the throughput. So there's no new information here but thinking about the time in terms of number of instructions and cycles is helpful to understand nsight-compute metrics.
 
-#### Benchmarking Setup
+### Benchmarking Setup
 As a baseline for peformance we use the cuBLAS `cublasGemmEx` API with `fp16` inputs and`fp32` accumulation. This performs a `M=N=K=4096` matrix multiply in 890 us which is a throughput of 154.4 TFLOPS/s, 93.5% of the RTX 4090's peak.
 
 How to accurately time CUDA kernel execution could fill an entire post but in summary either cuda events or nsight-compute give broadly consistent results if you first lock the gpu and memory clocks. I used nsight-compute as it measures kernel execution more precisely than possible using events [^5]. 
@@ -42,7 +42,7 @@ sudo nvidia-smi --lock-memory-clocks=10501 # max for RTX 4090
 ncu -k $my_kernel_name --clock-control none --print-summary per-gpu $my_executable
 ```
 
-#### Aside: Tensor Core Matrix Multiply APIs
+### Aside: Tensor Core Matrix Multiply APIs
 There are three separate Tensor Core matmul APIs in CUDA/PTX:
 * WMMA: High level API available in both [CUDA](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-matrix-functions) and [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-wmma-instructions)
 * MMA: Lower level API just available in [PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-multiply-accumulate-operation-using-mma-instruction)
@@ -50,7 +50,7 @@ There are three separate Tensor Core matmul APIs in CUDA/PTX:
 
 All kernels in this post use the PTX mma API. wgmma is not an option as I am using an Ada architecture GPU. I chose mma over wmma as mma is a lower level API and my aim is to build as deep an understanding of Tensor Core operations as possible. Using mma also reportedly delivers higher performance than wmma though that comparison is old[^1].
 
-### Kernel 1: Naive mma.sync kernel
+## Kernel 1: Naive mma.sync kernel
 The first kernel is a naive implementation resulting from reading the `mma.sync` instruction documentation and handling data movement from global memory to registers in the simplest way possible. 
 
 In the Ada architecture there are 4 warp schedulers per SM, each with their own Tensor Core. Hence we want at least 4 warps per thread block (not strictly required as multiple thread blocks can run concurrently on one SM). In this kernel we use a 16x16 thread block, containing 8 warps. Each warp computes one 16x8 output tile and we arrange the warps in a 2 row x 4 column grid, so that each thread block computes a 32x32 output tile.
@@ -121,7 +121,7 @@ for (int kStart=0; kStart < K; kStart += K_BLOCK) {
   __syncthreads();
 }
 ```
-#### Performance
+### Performance
 Kernel 1 has an execution time of 4.67 ms, giving a throughput of 29.4 TFLOP/S, 19.1% of cuBLAS and 17.8% of peak RTX 4090 performance. In fact Kernel 1 only achieves 35.6% of the RTX 4090's peak FP32 performance, so a reasonably optimized non Tensor Core kernel would be faster. The reasons for the poor performance are:
 1. Each thread loads individual 16b values which is very inefficient. Also the global load pattern is not coalesced. 
 2. The loads from shared memory to registers have multiple bank conflicts. 
@@ -156,7 +156,7 @@ These three problems with Kernel 1 will be addressed in Kernel 2: Point 1 by usi
 
 To isolate the impact made just by tiling vs the other changes, we add 2x tiling in the M and N dimensions in Kernel 1b. In this kernel each warp executes 4 `mma` instructions meaning each thread block computes a 64x64 output tile. This reduces execution time to 2.47 ms, increasing throuput to 55.6 TFLOP/S, 36% of cuBLAS performance.
 
-#### Aside: Floating Point Accuracy
+### Aside: Floating Point Accuracy
 NVIDIA does not fully document the exact numerical behavior of the Tensor Core `mma` instruction. The PTX ISA states: 
 ![mma-numeric](/assets/images/mma-numeric.png)
 Getting into these details is not the focus of this post, but one example of rounding error is worth noting. Kernel 1 accumulates the results of the main loop over K directly in `dReg` meaning at each iteration the accumulation `dReg = dReg + aReg * bReg` happens within the `mma` operation, which can cause loss of precision if `dReg` is large compared to `aReg * bReg`.
@@ -173,14 +173,14 @@ dRegAcc.w += dRegPtr->w;
 ```
 This incurs a performance penalty of around `50us`, reduces the difference by two orders of magnitude and centers it. This is demonstrated in Kernel 1b but I have not included in the subsequent kernels as whether it's requried or not will depend on input data and desired accuracy level. Detailed investigation into the numerical behavior of Tensor Cores in general can be found in [^4].
 
-### Kernel 2: Vectorized Loads & Permuted Shared Memory Layout
+## Kernel 2: Vectorized Loads & Permuted Shared Memory Layout
 ### Notes
 Random things I have discovered so I don't forget
 - Bank conflict count from ncu is misleading, if shared mem ideal == actual then no bank conflct as detailed here <https://forums.developer.nvidia.com/t/shared-memory-bank-conflicts-and-nsight-metric/115731/3>. This only seems to happen on kernel 3. 
 - ncu fixes clock to base so times slower than nsys and cudaEvent which don't do this: <https://forums.developer.nvidia.com/t/nsight-compute-clock-speed-during-profiling/208646>.
 - Using cp.async introduces other bank conflicts, but they show up in the source page but not in the details page, i.e. reverse of what is descibed in the link above.
 
-### Kernel 2: Real Final version.v1.v1 (2)  
+## Kernel 2: Real Final version.v1.v1 (2)  
 In this kernel we use some of the techniques (vectorized loads and permuted shared memory layout) discussed in the GTC 2020 CUTLASS presentation[^3] to resolve the performance issues of Kernel 1. Diagrams in this and subsequent sections are taken from that presentation. 
 
 Throughout this kernel we operate on `uint4` 128b vectors containing 8 consecutive `fp16` elements in the K dimension of A and B. Working with 128b vectors is natural when using Tensor Cores as the fundamental Tensor Core operation is an 8 by 8 by 128b matrix multiply, i.e. each 128b vector forms one row of the input matrices. Using 128b vectors also means we can vectorize memory operations. 
@@ -267,49 +267,24 @@ Two things to note
 
 One the main loop has finished, the output tile for each warp is accumulated in the output registers used for the `mma` instructions. There is a `stmatrix` instruction but this requires `sm_90` so is not available on Ada. We write directly from registers to global memory, it may be possible to optimize this by writing first to shared and then writing to global in a coalesced pattern but that requires more shared memory per threadblock which could reduce occupancy. I experimented with this but did not see a performance improvement.
 
-#### Performance
-Kernel 2 has greatly increased performance. Execution time is 1.06 ms, a throughput of 129.7 TFLOP/S which is 81.1% cuBLAS and 78.5% of RTX 4090 peak performance. We can make one minor tweak to the kernel to improve performance further, currently we reload each tile of A for each tile of B, this reduces register usage but introduces redundant loads from shared memory to registers. 
+### Performance
+Kernel 2 has greatly increased performance. Execution time is 1060 us, a throughput of 129.7 TFLOP/S which is 81.1% cuBLAS and 78.5% of RTX 4090 peak performance. We can make one minor tweak to the kernel to improve performance further, currently we reload each tile of A for each tile of B, this reduces register usage but introduces redundant loads from shared memory to registers. 
 
-In Kernel 2b we only load each tile of A once. This improves performance to 1.03 ms, 133.4 TFLOP/s, 86.4% of cuBLAS. The elapsed cycles per mma for Kernel 2b is 38, much closer to the minimum of 32. The ratio of total instrucitons to `mma` instructions is reduced from 31 for Kernel 1 to 3.9 for Kernel 2b.
+In Kernel 2b we only load each tile of A once. This improves performance to 1030 us, 134.7 TFLOP/s, 87.3% of cuBLAS. The elapsed cycles per mma for Kernel 2b is 38, much closer to the minimum of 32. The ratio of total instrucitons to `mma` instructions is reduced from 31 for Kernel 1 to 3.9 for Kernel 2b.
+
+The permuted shared memory layout should make these kernels bank-conflict free and we verify this for Kernel 2b:
+
+![kernel-2b-conflict](/assets/images/kernel-2b-conflict.png)
 
 Looking at the warp stats shows that the most frequent cause of stalls is now waiting for the Tensor Cores to be free - this is good!
 
 ![2b-warp-stats](/assets/images/kernel-2b-warp-stats-1.png)
 
-There are still considerable numbe of barrier and long scoreboard stalls, which we'll address in Kernel 3 by introducing an n-stage pipeline from global to shared memory using the `cp.async` instruction.
 
-### Kernel 3: N-stage global to shared pipeline
-Before moving to the full N stage pipeline we make a smaller change to Kernel 2, adding double buffering, which does not require `cp.async`. Double buffering introduces a second shared memory array for the tiles of `A` and `B`. When loading data from global to shared on each main loop iteration, we alternate between which of the two shared memory arrays we use for storage. This allows us to remove the `__syncthreads` call at the end of the main loop: as we are writing to a different shared memory array than the one we are currently reading from, we no longer need to wait for all threads in the block to be finished reading before starting to write.
+There are still considerable number of barrier and long scoreboard stalls, which we'll address in Kernel 3 by introducing an n-stage pipeline from global to shared memory using the `cp.async` instruction.
 
-This requires minor changes to the main loop of the kernel as shown below:
-```c++
-// double shared memory array sizes
-__shared__ uint4 As[2*32][8];
-__shared__ uint4 Bs[2*32][8];
-for (int k = 0; k < K/8; k += 4) {
-  shmem_offset = 32 * ((k/4) % 2); // define which half As/Bs we use at this iteration
-  As[shmem_offset + warpID*4 + laneID/8][storeCol] = globalTileA[(warpID*8 + laneID/4)*K/8 + k + laneID%4];
-  Bs[shmem_offset + warpID*4 + laneID/8][storeCol] = globalTileB[(warpID*8 + laneID/4)*K/8 + k + laneID%4];
-  __syncthreads();
-
-  for (int mTile = 0; mTile < 2; mTile++) {
-    load_matrix_x4(aReg, (As[shmem_offset + mTile*8 + warpOffsetA + loadRowA] + loadColA));
-    load_matrix_x4(aReg + 4, (As[shmem_offset + mTile*8 + warpOffsetA + loadRowA] + (loadColA^2)));
-    for (int nTile = 0; nTile < 2; nTile++) {
-      load_matrix_x2(bReg, (Bs[shmem_offset + nTile*4 + warpOffsetB + loadRowB] + loadColB));
-      mma_m16n8k16(aReg, bReg, dReg[mTile][nTile]);
-      load_matrix_x2(bReg, (Bs[shmem_offset + nTile*4 + warpOffsetB + loadRowB] + (loadColB^2)));
-      mma_m16n8k16(aReg+4, bReg, dReg[mTile][nTile]);
-    }
-  }
-  // no longer require __syncthreads(); here
-}
-```
-Performance is very minorly improved from Kernel 2: 1.01ms to 1.00ms.
-
-Without using asynchronous copies, double buffering is the deepest memory pipeline we can create: we will always require a `__synctheads()` before reading, and this will block until all threads in the block have completed their copies so there is no way to further overlap data loading with computation. Moving to `cp.async` gives us finer control of how we wait for copies to complete and will resolve this problem.
-
-There are asyncronous copy APIs both in CUDA (`cuda::memcpy_async`) and PTX (`cp.async`). The `cuda::memcp_async` API does not allow permuting elements of the copy within a warp, and hence we use the PTX `cp.async` API. As before we deine a wrapper function for inline PTX:
+## Kernel 3: N-stage global to shared pipeline
+There are asyncronous copy APIs both in CUDA (`cuda::memcpy_async`) and PTX (`cp.async`). The `cuda::memcp_async` API does not support copying with a permuted layout and hence we use the PTX `cp.async` API. As before we deine a wrapper function for the inline PTX call:
 {% raw %}
 ```c++
 __device__ void cp_async(uint4 *dstAddr, const uint4 *srcAddr) {
@@ -321,6 +296,7 @@ __device__ void cp_async(uint4 *dstAddr, const uint4 *srcAddr) {
 }
 ```
 {% endraw %}
+The final `"n"(16)` input is the number of bytes to copy, and needs to be a compile time constant.
 
 We can then use this function to replace the global to shared load:
 ```c++
@@ -334,7 +310,7 @@ asm volatile("cp.async.commit_group;\n" ::);
 ```
 The `cp.async.commit_group` instruction groups these copies together in a `cp.async-group` which can later be waited on using `cp.async.wait_group`.
 
-We now use `cp.async` to set up an N stage pipeline from global to shared memory. We create circular buffers of size `N_STAGES` for A and B in shared memory. Before the main loop of the kernel we preload the first `N_STAGES - 1` stages into these shared memory buffers using `cp.async`:
+We now use `cp.async` to set up an n-stage pipeline from global to shared memory. We create circular buffers of size `N_STAGES` for A and B in shared memory. Before the main loop of the kernel we preload the first `N_STAGES - 1` stages into these shared memory buffers using `cp.async`:
 
 ```c++
 __shared__ uint4 As[N_STAGES*32][8];
@@ -349,9 +325,7 @@ for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
   asm volatile("cp.async.commit_group;\n" ::);
 }
 ```
-At the start of the main loop there are at most `N_STAGES-1` `cp.async` operations pending, this is an invariant that will be maintained at each loop iteration. We initialize shared memory load and store pointers to stages `0` and `N_STAGES-1` respectively. We then wait for the first `cp.async` to complete, i.e. until there are at most `N_STAGES-2` `cp.async` operations pending using `cp.async.wait_group`. Note that we require a `__syncthreads` after `wait_group` as `wait_group` just synchronizes copy operations within each thread, not across threads.
-
-We then load shared memory stage 0 to registers, in this kernel we preload the entire `M/N=64, K=4` tile into registers, requiring 16 registers for `A` and 8 for `B`. The extra shared memory required by the `N_STAGES` shared memory buffer is the occupancy bottleneck so using these extra registers makes sense to parallelize the loads as much as possible. After the starting the loads to registers, we submit the next `cp.async` instruction, writing to stage N_STAGES-1. Finally we perform the `mma` instructions and increment the load and store pointers modulo N_STAGES.
+At the start of the main loop there are at most `N_STAGES-1` `cp.async` operations pending, this is an invariant that will be maintained at each loop iteration. We initialize shared memory load and store pointers to stages `0` and `N_STAGES-1` respectively and then wait for the first copy to complete, i.e. until there are at most `N_STAGES-2` cp.async operations pending. Note that a `__syncthreads` is required after `wait_group` as `wait_group` just synchronizes copy operations within each thread, not across threads.
 
 ```c++
 //  MAIN LOOP OVER K BLOCKS
@@ -392,18 +366,47 @@ for (int nStage=0; nStage < K/32; nStage++) {
   }
 }
 ```
-As `N_STAGES-1` K blocks were loaded before the main loop, on the last `N_STAGES-1` iterations through the main loop we don't need to load any more data from global memory. However the argmument to `cp.async.wait_group` needs to be a compile time constant and submitting superfluous copies is a hacky way to keep the argument to `wait_group` fixed at `N_STAGES-2`. Without these copies the kernel gives incorrect results unless we decrease the number of `cp.async` results allowed to be pending in the last `N_STAGES-1` iterations.
+Next we load the current shared memory stage to registers. In this kernel we preload the entire `M/N=64, K=4` tile into registers, requiring 16 registers for `A` and 8 for `B`. The extra shared memory required by the `N_STAGES` shared memory buffers is the occupancy bottleneck so using these extra registers makes sense to parallelize the loads as much as possible. After the starting the loads to registers, we submit the next `cp.async` instruction, and finally we perform the `mma` instructions and increment the load and store pointers modulo N_STAGES.
 
-From a performance perspective Kernel 3 reduces kernel duration to 960us from 1050us for Kernel 2, when using `N_STAGES=3`. Looking at profiler output shows:
+As `N_STAGES-1` K blocks were loaded before the main loop, on the last `N_STAGES-1` iterations through the main loop we don't need to load any more data from global memory. However the argmument to `cp.async.wait_group` needs to be a compile time constant and submitting superfluous copies is a hacky way to keep the argument to `wait_group` fixed at `N_STAGES-2`. Without these copies the kernel would be incorrect unless we decreased this argument on each of the last `N_STAGES-1` iterations.
 
-A kernel duration of 960ms means our performance is still only 87% of cuBLAS. Increasing `N_STAGES` does not improve performance, `N_STAGES=4` is roughly the same and `N_STAGES=5` decreases performance due to lower occupancy. Increasing the thead block tile size on the other hand does improve performance. In Kernel 3b we double the tile sizes to `(M/N=128, K=4)` meaning each warp performs `M=4 x N=4 x K=2 == 32` `mma` instructions. Kernel execution time is reduced to `850us` TODO add final numbers, a slight improvement in cuBLAS performance. 
+### Performance
+Sadly after all that effort Kernel 3 is a very minor improvement over Kernel 2b. Setting `N_STAGES=3` seems to give the best performance, `N_STAGES=4` is roughly the same and higher has worse performance. For `N_STAGES=3`, the execution time is 1000 us, giving 137.4 TFLOP/s, 89% cuBLAS, 83.2% 4090 peak performance, with `N_STAGES=3`. Looking at the warp state stats shows that stalls are lower:
 
-Profiling shows
+![3-warp-stats](/assets/images/kernel-3-warp-stats.png)
 
-### Conclusion
-We've gone from a naive implementation with correspondingly poor performance, to a kernel that is actually slightly faster than cuBLAS, at least for this extremely specific problem formulation. While that's a nice bonus, the real goal here was to understand the components of a high performance Tensor Core matrix multiply kernel and (at least for me) that's been a success. 
+but this is is partially due to reduced occupancy: Kernel 2b has 32 warps per SM while Kernel 3 has 24 due to the extra shared memory requirements.
 
-All the code is a available on github TODO: link. 
+As stalls due to barrier synchronization is still high, a reasonable optimization is to try increasing the work each warp does within a main loop iteration. We do this in Kernel 3b by increasing the tiling in the M/N dimensions from 2 to 4. This doubles the threadblock tile size to `(M/N=128, K=4)` meaning that each warp performs 4x4x2=32 `mma` instructions per main loop iteration. 
+
+Kernel 3b has an execution time of 890 us, giving throughput of 154.4 TFLOP/s, 100% cuBLAS, 93.5% of RTX 4090 peak performance. Looking at the warp state stats shows that the vast majority of stalls are now due to waiting for Tensor Cores, in fact each warp now waits on average 36 cycles for a Tenor Core to be available:
+
+![3b-warp-stats](/assets/images/kernel-3b-warp-stats.png)
+
+The ratio of elapsed cycles to mma instructions for Kernel 3b is 34.2, consistent with the figure of 93.5% peak performance. 
+
+Surprisingly nsight-compute shows the Tensor Core utilization as only 47.3% so what is going on?
+
+![tc-util](/assets/images/tensor-core-util.png)
+
+It seems that nsight uses a fixed latency of 16 cycles when computing `smsp__pipe_tensor_op_hmma_cycles_active` as the metric is consistently 16x `smsp__inst_executed_pipe_tensor_op_hmma`. I think this is an error, the latency should be 32 for the `m16n8k16` `mma` instruction. 
+
+One final thing I noticed is that both Kernels 3 & 3b have bank conflicts, 3b nsight shows:
+
+![kernel-3b-conflict](/assets/images/kernel-3b-conflict.png)
+
+Confusingly in this view (Memory Tables) the conflicts appear only in the shared loads, whereas in the source metrics they appear both when copying from global to shared and when loading from shared to registers. The shared loads in particular use the same `ldmatrix` instruction as in Kernel 2, so I'm notsure how moving to `cp.async` introduces a conflict there. 
+
+It's possible these conflicts are not real, nsight-compute reports erroneous conflicts in some cases as described [here](https://forums.developer.nvidia.com/t/shared-memory-bank-conflicts-and-nsight-metric/115731/12). I need to look into this further and will update the post if/when I find out what's going on here.
+
+## Conclusion
+We've gone from a naive implementation with correspondingly poor performance, to a kernel that is on par with cuBLAS, at least for this extremely specific problem formulation. In the process we've gained an understanding.
+
+While that's a nice bonus, the real goal here was to understand the components of a high performance Tensor Core matrix multiply kernel and (at least for me) that's been a success. 
+
+
+## Code 
+Code is available here
 
 
 ### Remaing stuff is older version of Kernel 2 description - some still needs to be incorporated into current version
@@ -471,7 +474,7 @@ Loading `B` is similar except we load a `(N=8, K=16)` tile for each `mma`.
 ### References
 [^1]: [GTC 2019 Programming Tensor Cores: Navtive Volta Tensor Cores With CUTLASS](https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9593-cutensor-high-performance-tensor-operations-in-cuda-v2.pdf)
 
-[^2]: Originally FLOPS stood for Floating point Operations Per Second. However In deep learning it is sometimes also used a measure of quantity i.e. to mean Floating point Operations. To prevent confusion I am using FLOP/s for rates and FLOP for quantities, as suggested [here](https://blog.heim.xyz/flop-for-quantity-flop-s-for-performance).
+[^2]: Originally FLOPS stood for Floating point Operations Per Second. However In deep learning it is also used a measure of quantity i.e. to mean Floating point Operations. To prevent confusion I am using FLOP/s for rates and FLOP for quantities, as suggested [here](https://blog.heim.xyz/flop-for-quantity-flop-s-for-performance).
 
 [^3]: [GTC 2020 Developing CUDA Kernels to Push Tensor Cores to the Absolute Limite on NVIDIA A100](https://www.nvidia.com/en-us/on-demand/session/gtcsj20-s21745)
 
