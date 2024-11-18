@@ -23,7 +23,7 @@ In the process we'll learn about the `mma`, `ldmatrix` and `cp.async` PTX instru
 As may be clear already, this post was heavily inspired by Simon Boehm's great worklog on optimizing a CUDA matmul kernel[^8]. 
 
 ## Problem Definition 
-We'll focus on one particular problem shape: M=N=K=4096, and data types: A/B `fp16`, C/D `fp32`. The FLOP count of this operation is `2*4096^3 = 137.4 GFLOP`[^2] (conventional to count one FMA as 2 FLOP) and the peak `fp16/32` throughput of the RTX 4090 is 165.2 TFLOP/s[^6], so the lower bound on kernel execution time is ~830 us.
+We'll focus on one particular problem shape: M=N=K=4096, for `fp16` A/B and `fp32` C/D. This operation is `2*4096^3 = 137.4 GFLOP`[^2] (conventional to count one FMA as 2 FLOP) and the peak `fp16/32` throughput of the RTX 4090 is 165.2 TFLOP/s[^6], so the lower bound on kernel execution time is ~830 us.
 
 We can use the peak throughput number to deduce how many cycles one Tensor Core instruction takes to complete (latency). All our kernels will use the PTX `m16n8k16` `mma` instruction, this is the largest Tensor Core matmul supported on Ada so it's reasonable to assume the peak throughput is obtained using this instruction. 
 
