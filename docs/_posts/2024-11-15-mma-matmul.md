@@ -5,9 +5,9 @@ license: "CC BY"
 permalink: /mma-matmul
 
 ---
-Using tensor cores is a prerequisite to get anywhere near peak performance matrix multiplication on NVIDIA GPUs from Volta onwards. 
+Using Tensor Cores is now a prerequisite to get anywhere near peak performance on NVIDIA GPUs. In this post we work through the process of developing an efficient Tensor Core matrix multiplication kernel targeting the Ada architecture. 
 
-In this post we work through the process of developing an efficient Tensor Core matrix multiplication kernel targeting the Ada architecture. We start with a naive implementation and by incorporating techniques used in CUTLASS[^3], finish with a kernel that matches cuBLAS performance (on one particular problem specification):
+We start with a naive implementation and by incorporating techniques used in CUTLASS[^3], finish with a kernel that matches cuBLAS performance (on one particular problem specification):
 
 | Kernel | Execution Time | TFLOP/s &nbsp; &nbsp; | % cuBLAS &nbsp; &nbsp;  | % 4090 peak &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; |
 | ---    | ---     | ---                 | ---                  | --- |
