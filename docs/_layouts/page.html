@@ -9,6 +9,9 @@ layout: default
 
   <div class="post-content">
     {{ content }}
+    {%- if page.license -%}
+      <br> {%- include license.html -%}
+    {%- endif -%}
   </div>
 
 </article>

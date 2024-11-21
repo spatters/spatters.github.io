@@ -1,6 +1,7 @@
 ---
 layout: page
 title: "Implementing a fast Tensor Core matmul on the Ada Architecture"
+license: "CC BY"
 permalink: /mma-matmul
 
 ---
