@@ -28,12 +28,12 @@ We'll focus on one particular problem shape: M=N=K=4096, for `fp16` A/B and `fp3
 
 We can use the peak throughput number to deduce how many cycles one Tensor Core instruction takes to complete (latency). All our kernels will use the PTX `m16n8k16` `mma` instruction, this is the largest Tensor Core matmul supported on Ada so it's reasonable to assume the peak throughput is obtained using this instruction. 
 
-The m16n8k16 operation is `2*16*8*16=4096` FLOPS, and there are 512 Tensor Cores on the RTX 4090, hence computing one mma on all Tensor Cores gives 2,097,152 FLOPS. Given the peak throughput of 165.2 TFLOPS/s at the boost clock of 2520 MHz, it must take 12.7 ns = 32 cycles for the `m16n8k16` `mma` operation to complete. This is roughly consistent with empirical benchmarks[^7].
+The m16n8k16 operation is `2*16*8*16=4096` FLOP, and there are 512 Tensor Cores on the RTX 4090, hence computing one mma on all Tensor Cores gives 2,097,152 FLOP. Given the peak throughput of 165.2 TFLOP/s at the boost clock of 2520 MHz, it must take 12.7 ns = 32 cycles for the `m16n8k16` `mma` operation to complete. This is roughly consistent with empirical benchmarks[^7].
 
 Our problem shape of M=N=K=4096 requires 256x512x256 = 33,554,432 individual m16n8k16 `mma` instructions, which is 65,536 card-wide waves of `mma`s. Hence in the best case, with no cycles stalled waiting for input, the minimum number of cycles this will take is 65,636 * 32 = 2,097,152, which is 832 us at the boost clock of 2520 MHz. Note this agrees with the number computed using peak throughput by definition as we computed the 32 cycle latency from the throughput. 
 
 ## Benchmarking Setup
-As a baseline for performance we use the cuBLAS `cublasGemmEx` API with `fp16` inputs and`fp32` accumulation. This performs a `M=N=K=4096` matrix multiply in 895 us which is a throughput of 153.6 TFLOPS/s, 93.0% of the RTX 4090's peak.
+As a baseline for performance we use the cuBLAS `cublasGemmEx` API with `fp16` inputs and`fp32` accumulation. This performs a `M=N=K=4096` matrix multiply in 895 us which is a throughput of 153.6 TFLOP/s, 93.0% of the RTX 4090's peak.
 
 How to accurately time CUDA kernel execution could fill an entire post but in summary either CUDA events or nsight-compute give broadly consistent results if you first lock the gpu and memory clocks. I used nsight-compute as it measures kernel execution more precisely than possible using events [^5]. 
 
